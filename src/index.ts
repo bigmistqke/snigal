@@ -11,16 +11,17 @@
 /*                                                                                */
 /**********************************************************************************/
 
-let CURRENT_NODE: ReactiveNode | undefined
+type Parent = Root | Effect | Computed
+let PARENT: Parent | undefined
 
-export const getParent = () => CURRENT_NODE
-export function runWithParent<T>(owner: ReactiveNode | undefined, callback: () => T) {
-  let previous = CURRENT_NODE
-  CURRENT_NODE = owner
+export const getParent = () => PARENT
+export function runWithParent<T>(owner: Parent | undefined, callback: () => T) {
+  let previous = PARENT
+  PARENT = owner
   try {
     callback()
   } finally {
-    CURRENT_NODE = previous
+    PARENT = previous
   }
 }
 
@@ -30,7 +31,7 @@ export function runWithParent<T>(owner: ReactiveNode | undefined, callback: () =
 /*                                                                                */
 /**********************************************************************************/
 
-export const onCleanup = (callback: () => void) => CURRENT_NODE?.onCleanupHandlers.add(callback)
+export const onCleanup = (callback: () => void) => PARENT?.onCleanupHandlers.add(callback)
 
 /**********************************************************************************/
 /*                                                                                */
@@ -90,15 +91,15 @@ abstract class ReactiveNode {
   parent: ReactiveNode | undefined
 
   constructor() {
-    this.parent = CURRENT_NODE
-    CURRENT_NODE?.children.add(this)
+    this.parent = PARENT
+    PARENT?.children.add(this)
   }
 
   addObserver() {
     if (!shouldTrack) return
-    if (!CURRENT_NODE) return
-    this.observers.add(CURRENT_NODE)
-    CURRENT_NODE.dependencies.add(this)
+    if (!PARENT) return
+    this.observers.add(PARENT)
+    PARENT.dependencies.add(this)
   }
   cleanup() {
     this.onCleanupHandlers.forEach((cleanup) => cleanup())
@@ -129,9 +130,7 @@ abstract class ReactiveNode {
       if (observer instanceof Snigal) return
       if (observer.flag !== 'clean') return
       observer.flag = 'update'
-      if (observer instanceof Computed) {
-        observer.dependenciesAreStale = true
-      } else if (observer instanceof Effect) {
+      if (observer instanceof Effect) {
         EFFECT_QUEUE.push(observer)
         scheduleFlush()
       }
@@ -142,22 +141,30 @@ abstract class ReactiveNode {
     this.flag = 'clean'
   }
   resolve() {
-    if (this instanceof Snigal) return this.update()
+    if (this instanceof Snigal) {
+      this.update()
+      return
+    }
 
     let shouldUpdate = false
 
     this.dependencies.forEach((dependency) => {
       if (dependency.flag === 'clean') return
-      if (dependency.resolve()) shouldUpdate = true
+      dependency.resolve()
+      if (dependency.flag === 'dirty') {
+        shouldUpdate = true
+      }
     })
 
     // if none of the dependencies has changed
     //    do not update and return false
-    if (!shouldUpdate) return false
-
-    return this.update()
+    if (!shouldUpdate) {
+      this.flag = 'clean'
+      return
+    }
+    this.update()
   }
-  abstract update(): boolean
+  abstract update(): void
 }
 
 /**********************************************************************************/
@@ -167,10 +174,10 @@ abstract class ReactiveNode {
 /**********************************************************************************/
 
 export class Snigal<T> extends ReactiveNode {
+  needsReset = false
   constructor(public value: T) {
     super()
   }
-
   get() {
     this.addObserver()
     return this.value
@@ -179,6 +186,7 @@ export class Snigal<T> extends ReactiveNode {
     const shouldUpdate = value !== this.value
     this.value = value
     if (shouldUpdate) {
+      this.needsReset = true
       this.flag = 'dirty'
       this.markObservers()
     }
@@ -186,7 +194,10 @@ export class Snigal<T> extends ReactiveNode {
   }
   update() {
     const shouldUpdate = this.flag === 'dirty'
-    queueMicrotask(this.reset.bind(this))
+    if (this.needsReset) {
+      this.needsReset = false
+      queueMicrotask(this.reset.bind(this))
+    }
     return shouldUpdate
   }
 }
@@ -200,39 +211,33 @@ export class Snigal<T> extends ReactiveNode {
 export class Computed<T = any> extends ReactiveNode {
   //@ts-ignore
   private value: T
-  valueHasChanged = false
-  dependenciesAreStale = true
 
   constructor(public callback: () => T) {
     super()
+    this.flag = 'update'
   }
 
   get() {
-    if (this.dependenciesAreStale) this.update()
+    if (this.flag === 'update') this.update()
     this.addObserver()
     return this.value
   }
   reset() {
     super.reset()
-    this.valueHasChanged = false
   }
   update() {
-    if (!this.dependenciesAreStale) {
-      return this.valueHasChanged
-    }
-    let previous = CURRENT_NODE
+    if (this.flag !== 'update') return
+    let previous = PARENT
     try {
-      CURRENT_NODE = this
+      PARENT = this
       let previousValue = this.value
       this.cleanupDependencies()
       this.cleanup()
       this.value = this.callback()
-      this.dependenciesAreStale = false
-      this.valueHasChanged = previousValue !== this.value
+      this.flag = previousValue !== this.value ? 'dirty' : 'clean'
     } finally {
-      CURRENT_NODE = previous
+      PARENT = previous
       queueMicrotask(this.reset.bind(this))
-      return this.valueHasChanged
     }
   }
 }
@@ -245,7 +250,7 @@ export class Computed<T = any> extends ReactiveNode {
 
 export class Effect extends ReactiveNode {
   constructor(public callback: () => void, immediate?: boolean) {
-    if (!CURRENT_NODE) {
+    if (!PARENT) {
       console.warn('effects outside of root will not be automatically disposed')
     }
     super()
@@ -259,15 +264,15 @@ export class Effect extends ReactiveNode {
   update() {
     if (this.isDisposed) return false
     if (this.parent && this.parent?.flag !== 'clean') return false
-    let previous = CURRENT_NODE
+    let previous = PARENT
     try {
-      CURRENT_NODE = this
+      PARENT = this
       this.cleanupDependencies()
       this.cleanupObservers()
       this.cleanup()
       this.callback()
     } finally {
-      CURRENT_NODE = previous
+      PARENT = previous
       this.flag = 'clean'
       return true
     }
@@ -280,21 +285,19 @@ export class Effect extends ReactiveNode {
 /*                                                                                */
 /**********************************************************************************/
 
-export class Root<T> extends ReactiveNode {
-  constructor(callback: () => T) {
+export class Root extends ReactiveNode {
+  constructor(callback: () => void) {
     super()
-    let previous = CURRENT_NODE
+    let previous = PARENT
     try {
-      CURRENT_NODE = this
+      PARENT = this
       callback()
-    } catch (e) {
-      throw e
     } finally {
-      CURRENT_NODE = previous
+      PARENT = previous
     }
   }
 
-  update() {
-    return true
+  update(): boolean {
+    throw 'Root should not update'
   }
 }
