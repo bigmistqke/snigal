@@ -5,7 +5,49 @@
  * @article https://github.com/solidjs/signals
  */
 
+/**********************************************************************************/
+/*                                                                                */
+/*                          Get Parent / Run With Parent                          */
+/*                                                                                */
+/**********************************************************************************/
+
 let CURRENT_NODE: ReactiveNode | undefined
+
+export const getParent = () => CURRENT_NODE
+export function runWithParent<T>(owner: ReactiveNode | undefined, callback: () => T) {
+  let previous = CURRENT_NODE
+  CURRENT_NODE = owner
+  try {
+    callback()
+  } finally {
+    CURRENT_NODE = previous
+  }
+}
+
+/**********************************************************************************/
+/*                                                                                */
+/*                                   On Cleanup                                   */
+/*                                                                                */
+/**********************************************************************************/
+
+export const onCleanup = (callback: () => void) => CURRENT_NODE?.onCleanupHandlers.add(callback)
+
+/**********************************************************************************/
+/*                                                                                */
+/*                                     Untrack                                    */
+/*                                                                                */
+/**********************************************************************************/
+
+let shouldTrack = true
+
+export function untrack<T>(callback: () => T) {
+  try {
+    shouldTrack = false
+    return callback()
+  } finally {
+    shouldTrack = true
+  }
+}
 
 /**********************************************************************************/
 /*                                                                                */
@@ -34,43 +76,34 @@ const scheduleFlush = () => {
 
 /**********************************************************************************/
 /*                                                                                */
-/*                                     Untrack                                    */
-/*                                                                                */
-/**********************************************************************************/
-
-let shouldTrack = true
-
-export const untrack = <T>(callback: () => T) => {
-  try {
-    shouldTrack = false
-    return callback()
-  } finally {
-    shouldTrack = true
-  }
-}
-
-/**********************************************************************************/
-/*                                                                                */
 /*                                  Reactive Node                                 */
 /*                                                                                */
 /**********************************************************************************/
 
 abstract class ReactiveNode {
-  observers: Set<ReactiveNode> = new Set()
-  dependencies: Set<ReactiveNode> = new Set()
   children = new Set<ReactiveNode>()
-  parent: ReactiveNode | undefined
+  isDisposed = false
+  onCleanupHandlers = new Set<() => void>()
+  dependencies = new Set<ReactiveNode>()
   flag: 'dirty' | 'update' | 'clean' = 'clean'
+  observers = new Set<ReactiveNode>()
+  parent: ReactiveNode | undefined
+
   constructor() {
     this.parent = CURRENT_NODE
     CURRENT_NODE?.children.add(this)
   }
-  cleanupChildren() {
-    this.children.forEach((child) => {
-      child.cleanupDependencies()
-      child.cleanupObservers()
-      child.cleanupChildren()
-    })
+
+  addObserver() {
+    if (!shouldTrack) return
+    if (!CURRENT_NODE) return
+    this.observers.add(CURRENT_NODE)
+    CURRENT_NODE.dependencies.add(this)
+  }
+  cleanup() {
+    this.onCleanupHandlers.forEach((cleanup) => cleanup())
+    this.onCleanupHandlers.clear()
+    this.children.forEach((child) => child.dispose())
     this.children.clear()
   }
   cleanupDependencies() {
@@ -85,11 +118,11 @@ abstract class ReactiveNode {
     })
     this.observers.clear()
   }
-  addObserver() {
-    if (!shouldTrack) return
-    if (!CURRENT_NODE) return
-    this.observers.add(CURRENT_NODE)
-    CURRENT_NODE.dependencies.add(this)
+  dispose() {
+    this.isDisposed = true
+    this.cleanupDependencies()
+    this.cleanupObservers()
+    this.cleanup()
   }
   markObservers() {
     this.observers.forEach((observer) => {
@@ -124,7 +157,6 @@ abstract class ReactiveNode {
 
     return this.update()
   }
-
   abstract update(): boolean
 }
 
@@ -138,6 +170,7 @@ export class Snigal<T> extends ReactiveNode {
   constructor(public value: T) {
     super()
   }
+
   get() {
     this.addObserver()
     return this.value
@@ -169,9 +202,11 @@ export class Computed<T = any> extends ReactiveNode {
   private value: T
   valueHasChanged = false
   dependenciesAreStale = true
+
   constructor(public callback: () => T) {
     super()
   }
+
   get() {
     if (this.dependenciesAreStale) this.update()
     this.addObserver()
@@ -190,7 +225,7 @@ export class Computed<T = any> extends ReactiveNode {
       CURRENT_NODE = this
       let previousValue = this.value
       this.cleanupDependencies()
-      this.cleanupChildren()
+      this.cleanup()
       this.value = this.callback()
       this.dependenciesAreStale = false
       this.valueHasChanged = previousValue !== this.value
@@ -210,27 +245,56 @@ export class Computed<T = any> extends ReactiveNode {
 
 export class Effect extends ReactiveNode {
   constructor(public callback: () => void, immediate?: boolean) {
+    if (!CURRENT_NODE) {
+      console.warn('effects outside of root will not be automatically disposed')
+    }
     super()
-    this.flag = 'update'
     if (immediate) {
       this.update()
     } else {
       queueMicrotask(this.update.bind(this))
     }
   }
+
   update() {
+    if (this.isDisposed) return false
     if (this.parent && this.parent?.flag !== 'clean') return false
     let previous = CURRENT_NODE
     try {
       CURRENT_NODE = this
       this.cleanupDependencies()
       this.cleanupObservers()
-      this.cleanupChildren()
+      this.cleanup()
       this.callback()
     } finally {
       CURRENT_NODE = previous
       this.flag = 'clean'
       return true
     }
+  }
+}
+
+/**********************************************************************************/
+/*                                                                                */
+/*                                      Root                                      */
+/*                                                                                */
+/**********************************************************************************/
+
+export class Root<T> extends ReactiveNode {
+  constructor(callback: () => T) {
+    super()
+    let previous = CURRENT_NODE
+    try {
+      CURRENT_NODE = this
+      callback()
+    } catch (e) {
+      throw e
+    } finally {
+      CURRENT_NODE = previous
+    }
+  }
+
+  update() {
+    return true
   }
 }
