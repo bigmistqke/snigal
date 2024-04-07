@@ -23,6 +23,6 @@ import { Snigal, Computed, Effect } from 'snigal'
 
 const snigal1 = new Snigal(0)
 const snigal2 = new Snigal(0)
-const computed = new Computed(() => signal1.get() + signal2.get())
+const computed = new Computed(() => snigal11.get() + snigal12.get())
 new Effect(() => console.log(computed.get()))
 ```
